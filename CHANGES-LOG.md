@@ -21,8 +21,21 @@ Common to every branch:
   that import `httpx` (not installed), Windows symlink tests, and a few timing or
   shared-state tests that fail only under `pytest -n auto` and pass alone
   (`test_visual_qa_large_board_runtime_and_memory`, `test_schematic_surface`,
-  `test_router_isolates_two_granted_projects_and_denies_foreign_tools`).
+  `test_router_isolates_two_granted_projects_and_denies_foreign_tools`). The
+  cloud transport tests under `tests/cloud/` (managed connector, read transport,
+  TLS/WSS) and the OpenAI eval-candidate tests also fail in that environment,
+  on the base tag as well.
 - **Upstream:** no pull request or issue has been opened for any of these.
+- **Skipped items:** an item whose fix needs an API design decision or would
+  change behaviour other users rely on is not implemented; its entry says why
+  and lists the options.
+- **Shared files:** several branches add fields to `src/kicad_mcp/models/pcb.py`
+  and edit `src/kicad_mcp/tools/pcb.py` (items 1, 6, 13, 14, 18), and several
+  regenerate `docs/evidence/progressive-disclosure-profile-snapshot.json`
+  (items 1, 6, 8, 13, 14). After merging, rerun
+  `python scripts/profile_surface_report.py` instead of hand-merging the JSON.
+
+Batch 1:
 
 | Item | Branch | Commit | Replaces |
 |---|---|---|---|
@@ -33,6 +46,18 @@ Common to every branch:
 | 4 | `fix/freerouting-privacy-flags` | `8e4c8ede` | privacy flags in `tools/autoroute.py` |
 | 5 | `fix/freerouting-exclude-nets` | `64613754` | net removal in `tools/autoroute.py` |
 | 18 | `fix/stackup-mask-layer-types` | `b3b474fe` | leaving masks out of `pcb_set_stackup` |
+
+Batch 2:
+
+| Item | Branch | Commit | Replaces |
+|---|---|---|---|
+| 6 | `fix/pcb-sync-updates-pad-nets` | `88c60c48` | `tools/apply_u2_swap.py` (pad-net part) |
+| 7 | `fix/local-label-justification` | `c7d7dad3` | `tools/fix_labels.py` (build-circuit part) |
+| 8 | `fix/junctions-at-pins-and-sheets` | `c099de92` | most of `tools/add_junctions.py` |
+| 12 | skipped (needs an API decision) | none | `tools/place_fields.py` stays |
+| 13 | `fix/board-outline-corner-radius` | `e632b978` | `tools/add_outline.py` |
+| 14 | `fix/mounting-hole-keepout` | `51abdd5a` | `tools/add_mounting_holes.py`, hole footprint in `tools/make_footprints.py` |
+| 16 | skipped (needs an API decision) | none | `tools/set_placeholder_models.py` stays |
 
 ---
 
@@ -259,15 +284,200 @@ Common to every branch:
 - **Merge notes:** item 1 also edits `src/kicad_mcp/tools/pcb.py` (tool bodies,
   not these helpers).
 
+## Item 6: `pcb_sync_from_schematic` reports and can update stale pad nets
+
+- **Branch:** `fix/pcb-sync-updates-pad-nets`, commit `88c60c48`.
+- **Problem:** the sync only added missing footprints and replaced ones with the
+  wrong footprint name. When the schematic moved a net to another pin of a part
+  already on the board (a pin swap), the stale pad nets were neither reported
+  nor updatable by the sync.
+- **Fix:** the sync compares each existing footprint's pad nets with the
+  schematic net map and reports the pads that differ (`- R1.1: VIN -> MID`). By
+  default nothing changes, so existing callers see only the extra report lines.
+  With the new opt-in `update_pad_nets=True`, only those pads' `(net ...)` nodes
+  are rewritten; position, rotation, fields and graphics stay. The force-directed
+  auto-place does not run for a pad-net-only update, so placed footprints do not
+  move. Pads that the schematic leaves unconnected keep their board net.
+- **Test:** `tests/integration/test_pcb_sync_pad_nets.py`: builds two resistors,
+  syncs, swaps R1's pin nets, then checks the default run reports both pads and
+  leaves the file unchanged, the opt-in run changes only R1's two net nodes (with
+  `auto_place=True`), and a third run finds nothing to change. On the base tag
+  the swap is not mentioned.
+- **Files:** `src/kicad_mcp/tools/pcb.py`, `src/kicad_mcp/models/pcb.py`
+  (`SyncPcbFromSchematicInput.update_pad_nets`), the new test, the profile
+  snapshot.
+- **Tool contract change:** new `update_pad_nets` parameter on
+  `pcb_sync_from_schematic`; regenerate the tool docs.
+- **Replaces:** the pad-net update in `tools/apply_u2_swap.py`, which rewrote
+  pad nets on the board after a pin swap in the schematic.
+- **Limits:** KiCad 10 pad nets (`(net "name")`) only. Tracks and zones attached
+  to the changed pads keep their old nets; DRC then shows what to reroute.
+
+## Item 7: `sch_build_circuit` keeps each label's `justify`
+
+- **Branch:** `fix/local-label-justification`, commit `c7d7dad3`. (The branch
+  name predates the scope decision below; the fix is in the build path.)
+- **Problem:** label inputs to `sch_build_circuit` are validated as
+  `AddLabelInput`, which accepts `justify`, but the builder dropped it when it
+  emitted the label, so built labels got KiCad's centred default (or the
+  rotation-derived default for global and hierarchical labels).
+  `sch_add_label` and `sch_add_labels_batch` already honoured it.
+- **Fix:** the builder passes `justify` through when a label sets it; labels
+  without it are emitted exactly as before (and older injected label emitters
+  are called without the keyword).
+- **Test:** `tests/integration/test_build_circuit_label_justify.py`: local
+  labels at 0, 90 and 180 degrees and a global label, each with a `justify`,
+  plus one without. It checks rotation and justification in the written file. On
+  the base tag every requested justification is missing. Label rotation was
+  already kept on the base tag.
+- **Files:** `src/kicad_mcp/schematic/circuit_compilation.py`, the new test.
+- **Replaces:** the build-circuit part of `tools/fix_labels.py` (re-applying the
+  intended justification after a `sch_build_circuit` call).
+- **Not done, needs a decision:** local labels written without `justify` are
+  still centred on their anchor. Upstream documents this as intended
+  (`sch_add_label`: "local labels have no directional icon so centered text is
+  usually correct"), while labels drawn in KiCad's editor carry an explicit
+  justification (for example `left bottom` at 0 degrees and `right bottom` at 180).
+  Changing the default would change
+  output that callers may rely on, so it is left for the maintainers.
+- **Merge notes:** items 2 and 3 also edit `circuit_compilation.py` (the symbol
+  and power loops, not the label loop).
+
+## Item 8: junctions follow KiCad's rule, on any sheet
+
+- **Branch:** `fix/junctions-at-pins-and-sheets`, commit `c099de92`.
+- **Problem:** `sch_add_missing_junctions` (and the auto-fix loop's junction
+  fixer) only found a wire end landing on another wire's middle. KiCad also
+  needs a junction where three or more connection ends meet, counting pin ends,
+  so for example a pin with two wires ending on it got no dot. The tool also
+  only worked on the active schematic.
+- **Fix:** the fixer also adds a junction where three or more wire ends and pin
+  ends (power-symbol pins included) meet. It never dots a point on a wire's
+  middle that only pins touch. Checked with kicad-cli 10: a pin on a wire's
+  middle without a junction is left unconnected (`unconnected-(R1-Pad1)` in the
+  netlist), so a dot there would change connectivity. Those pins are listed in
+  the result instead. Plain crossings are never dotted (also checked: crossing
+  wires stay two nets). New optional `sheet`/`sheet_file` parameters repair a
+  child sheet without switching the active schematic.
+- **Test:** `tests/integration/test_missing_junctions_pins_and_sheets.py`, with
+  six cases on one sheet: a pin with two wire ends, three wire ends, a T, a
+  pin on a wire's middle, a crossing and an end-to-end join. It runs once on the
+  active sheet and once on a child sheet via `sheet_file`. On the base tag the
+  pin case gets no dot and `sheet_file` is ignored. Also
+  `tests/unit/test_schematic_connectivity_authoring_registration.py` (contract
+  test updated for the new parameters and description).
+- **Files:** `src/kicad_mcp/tools/schematic.py`,
+  `src/kicad_mcp/schematic/connectivity_authoring.py`,
+  `src/kicad_mcp/tools/schematic_connectivity_authoring.py`, the tests, the
+  profile snapshot.
+- **Tool contract change:** `sch_add_missing_junctions` gains `sheet` and
+  `sheet_file`, and its description changed; regenerate the tool docs.
+- **Replaces:** most of `tools/add_junctions.py`, which added dots at hand-listed
+  points after checking that three or more ends meet there. The script's other
+  checks (each listed point's net name and parts) are not reproduced; the fixer
+  needs no list.
+- **Merge notes:** items 2 and 3 edit other parts of `tools/schematic.py`.
+
+## Item 12: setting a symbol's Reference/Value text position (skipped)
+
+- **Status:** not implemented, because it needs an API design decision.
+- **Problem:** no tool sets the position, angle or justification of a placed
+  symbol's Reference or Value text. `sch_update_properties` and
+  `sch_modify_property` change a field's value only (`value` is required), and
+  `sch_autoplace_fields` can put text on bodies, pins or wires.
+- **Why skipped:** both possible fixes change the tool surface. A new tool (for
+  example `sch_set_field_position(reference, field, x_mm, y_mm, angle,
+  justify, unit)`) must be added to the router categories, `capabilities.py`,
+  `ipc/capabilities.py`, the parity matrix, the progressive-disclosure profiles
+  and the generated docs, which is the maintainers' call. Making `value` optional
+  on `sch_modify_property` and adding position arguments would change an
+  existing contract.
+- **Still needed by the board project:** `tools/place_fields.py`.
+
+## Item 13: board outline with an optional corner radius
+
+- **Branch:** `fix/board-outline-corner-radius`, commit `e632b978`.
+- **Problem:** `pcb_set_board_outline` only took width and height, so a board
+  with rounded corners needed a hand-drawn outline of four lines and four arcs.
+- **Fix:** new `corner_radius_mm` (default 0, sharp corners as before), set on the
+  KiCad 10 API rectangle (`GraphicRectangleAttributes.corner_radius`; kipy 0.8
+  has no wrapper, so it is written on the protobuf). It must not exceed half the
+  shorter side. The retry check counts an existing outline as matching only
+  when corners and radius both match. If KiCad hands back a rectangle without
+  the requested radius, the result says so instead of reporting success.
+- **Test:** `tests/integration/test_board_outline_corner_radius.py`: the radius
+  reaches the created rectangle, retries compare it, the default stays sharp,
+  and an oversized radius is refused. On the base tag the radius is dropped and
+  an oversized one is accepted. Not checked against a running KiCad (the tool is
+  live IPC only).
+- **Files:** `src/kicad_mcp/tools/pcb.py`, `src/kicad_mcp/models/pcb.py`
+  (`SetBoardOutlineInput.corner_radius_mm`), the new test, the profile snapshot.
+- **Tool contract change:** new `corner_radius_mm` parameter; regenerate the
+  tool docs.
+- **Replaces:** `tools/add_outline.py`, which wrote four lines and four quarter
+  arcs into the board file with the board closed.
+- **Limits:** needs KiCad 10, since older KiCad has no rounded rectangle.
+
+## Item 14: mounting holes with an optional keep-out and hole clearance
+
+- **Branch:** `fix/mounting-hole-keepout`, commit `51abdd5a`.
+- **Problem:** `pcb_add_mounting_holes` drew the screw-head area as a courtyard
+  only, so nothing stopped tracks, vias or other footprints from going under
+  the screw head or washer, and the hole's copper clearance could not be set.
+- **Fix:** new opt-in parameters (defaults keep the old output):
+  - `keepout=True` adds a footprint rule area on F.Cu and B.Cu: a 36-sided
+    polygon circumscribing the courtyard circle, with no tracks, vias, pads or
+    footprints allowed.
+  - `keepout_allow_pours` (default True) chooses whether copper pours may fill
+    that area.
+  - `hole_clearance_mm` sets the non-plated hole pad's own clearance.
+- **Test:** `tests/integration/test_mounting_hole_keepout.py`: with pours allowed
+  and not allowed, every hole carries the rule area with all five rules, a
+  polygon that covers the courtyard, and the pad clearance. The default call
+  adds neither. On the base tag there is no rule area. Also checked by loading
+  and re-saving such a board in KiCad 10 (pcbnew): the rule area keeps all its
+  rules and the pad its clearance, and `kicad-cli pcb drc` loads the board.
+- **Files:** `src/kicad_mcp/tools/pcb.py`, `src/kicad_mcp/models/pcb.py`
+  (`AddMountingHolesInput`), the new test, the profile snapshot.
+- **Tool contract change:** three new parameters; regenerate the tool docs.
+- **Replaces:** `tools/add_mounting_holes.py` and the keep-out zone of the hole
+  footprint in `tools/make_footprints.py`. The server still writes its own inline
+  footprint (`MountingHole_<d>mm`), not a footprint from a project library.
+
+## Item 16: 3D model on a placed board footprint (skipped)
+
+- **Status:** not implemented, because it needs an API design decision.
+- **Problem:** `lib_set_3d_model_path`, `lib_remove_3d_model` and
+  `lib_bulk_assign_3d_models` edit footprint *library* files only. There is no way
+  to set or replace the 3D model of a footprint already placed on the board, as
+  needed when a library has no model for a package and a placeholder is used.
+- **Why skipped:** a fix means either a new `pcb_*` tool (router category,
+  capability tables, parity matrix, profile membership, docs; the committed
+  profile snapshots pin a tool budget per profile), or a `lib_*` tool that starts
+  writing the board file, which also needs the open-board guard. Both are API
+  decisions for the maintainers.
+- **Still needed by the board project:** `tools/set_placeholder_models.py`.
+
 ---
 
-## Found while fixing, not fixed
+## Candidates for a later batch
 
-- `pcb_set_stackup` on a board file without a `(setup ...)` section rebuilds the
-  file from a template and drops its other contents (seen on a bare
-  `(kicad_pcb (footprint ...))`; a board saved by KiCad is fine).
-- No `F_Paste`/`B_Paste` in the server's layer table (see item 18).
-- `sch_add_jumper` writes the default project name `KiCadMCP` into the symbol
-  instance instead of the active project's name.
-- `sch_build_circuit` writes a `(sheet_instances (path "/" ...))` section into
-  child-sheet files as well as the root.
+Found while fixing; not fixed on any branch yet.
+
+1. `pcb_set_stackup` on a board file without a `(setup ...)` section rebuilds the
+   file from a template and drops its other contents (seen on a bare
+   `(kicad_pcb (footprint ...))`; a board saved by KiCad is fine).
+2. No `F_Paste`/`B_Paste` in the server's layer table, so a stackup or any tool
+   that resolves layer names rejects the paste layers (see item 18).
+3. `sch_add_jumper` writes the default project name `KiCadMCP` into the symbol
+   instance instead of the active project's name.
+4. `sch_build_circuit` writes a `(sheet_instances (path "/" ...))` section into
+   child-sheet files as well as the root.
+5. `pcb_sync_from_schematic` reports every existing footprint as mismatched on a
+   re-sync ("board has Resistor_SMD:R_0805, schematic expects R_0805"): the board
+   name keeps its library prefix and the schematic side is compared without it.
+   With `replace_mismatched=True` that would replace every footprint. Found
+   while testing item 6.
+6. Default justification of local labels (see item 7): needs a maintainer
+   decision.
+7. Items 12 and 16 above: need maintainer decisions on the tool surface.
