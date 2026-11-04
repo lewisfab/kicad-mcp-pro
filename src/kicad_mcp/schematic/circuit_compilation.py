@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from ..file_formats import GENERATED_SEXPR_DIALECT_VERSION, GeneratedFormatUpgradeResult
 from ..models.schematic import AddLabelInput, AddSymbolInput, AddWireInput, PowerSymbolInput
+from .references import PowerReferenceAllocator, UsedReferences
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,8 @@ class SchematicCircuitCompilationService:
     upgrade_schematic: Callable[[Path], GeneratedFormatUpgradeResult]
     reload_schematic: Callable[[], str]
     warn_unresolved: Callable[[dict[str, Any]], None]
+    #: References already used in the project; ``None`` numbers each build from 1.
+    used_references: UsedReferences | None = None
 
     def analyze(
         self,
@@ -209,6 +212,7 @@ class SchematicCircuitCompilationService:
         snap_to_grid: bool,
         project_name: str,
         root_uuid: str,
+        allocate_power_reference: Callable[[str], str] | None = None,
     ) -> list[str]:
         elements: list[str] = []
         for symbol in prepared.symbols:
@@ -235,7 +239,11 @@ class SchematicCircuitCompilationService:
                     lib_id=f"power:{power.name}",
                     x=px,
                     y=py,
-                    reference=f"#PWR{index:03d}",
+                    reference=(
+                        allocate_power_reference(power.name)
+                        if allocate_power_reference is not None
+                        else f"#PWR{index:03d}"
+                    ),
                     value=power.name,
                     rotation=power.rotation,
                     project_name=project_name,
@@ -359,7 +367,19 @@ class SchematicCircuitCompilationService:
         root_uuid = self.new_uuid()
         project_name = self.project_name()
         library_section = self._collect_lib_symbols_section(prepared)
-        elements = self._collect_schematic_elements(prepared, snap_to_grid, project_name, root_uuid)
+        # The sheet's own symbols are replaced, so only other sheets' references count.
+        allocator = (
+            PowerReferenceAllocator(self.used_references(schematic_file, False))
+            if self.used_references is not None
+            else None
+        )
+        elements = self._collect_schematic_elements(
+            prepared,
+            snap_to_grid,
+            project_name,
+            root_uuid,
+            allocator.allocate if allocator is not None else None,
+        )
 
         content = (
             "(kicad_sch\n"

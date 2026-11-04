@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .references import power_reference_from_uuid
+from .references import (
+    PowerReferenceAllocator,
+    UsedReferences,
+    power_reference_from_uuid,
+)
 
 
 class SchematicTarget(Protocol):
@@ -143,6 +147,8 @@ class SchematicBasicAuthoringService:
     reload_schematic: ReloadSchematic
     new_uuid: NewUuid
     format_mm: FormatMm
+    #: References already used in the project; ``None`` keeps UUID-derived numbers.
+    used_references: UsedReferences | None = None
 
     @staticmethod
     def _format_target_detail(target: SchematicTarget) -> str:
@@ -429,6 +435,13 @@ class SchematicBasicAuthoringService:
             if part
         )
 
+    def _next_power_reference(self, name: str, sheet: str | None, sheet_file: str | None) -> str:
+        if self.used_references is None:
+            return power_reference_from_uuid(self.new_uuid())
+        target = self.resolve_target(sheet=sheet, sheet_file=sheet_file)
+        used = self.used_references(target.path, True)
+        return PowerReferenceAllocator(used).allocate(name)
+
     def add_power_symbol(
         self,
         name: str,
@@ -446,7 +459,7 @@ class SchematicBasicAuthoringService:
             symbol_name=name,
             x_mm=x_mm,
             y_mm=y_mm,
-            reference=power_reference_from_uuid(self.new_uuid()),
+            reference=self._next_power_reference(name, sheet, sheet_file),
             value=name,
             footprint="",
             rotation=rotation,

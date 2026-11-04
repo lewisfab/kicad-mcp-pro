@@ -10,7 +10,11 @@ from typing import Any, Protocol
 from ..errors import SchematicRoutingUnsafeError
 from ..models.schematic import RouteWireBetweenPinsInput
 from ..utils.schematic_router import point_on_segment, segments_merge
-from .references import power_reference_from_uuid
+from .references import (
+    PowerReferenceAllocator,
+    UsedReferences,
+    power_reference_from_uuid,
+)
 
 
 class SchematicTargetLike(Protocol):
@@ -161,6 +165,7 @@ class _PinLabelBatch:
         default_factory=dict
     )
     results: list[str] = field(default_factory=list)
+    allocate_power_reference: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +229,8 @@ class SchematicConnectivityAuthoringService:
     #: has to cross one to reach a pin inside it.  Defaults to none so a caller
     #: that predates the rule keeps working; only wire routing consults it.
     get_module_boundaries: Callable[[str], list[BoundingBoxLike]] = _no_module_boundaries
+    #: References already used in the project; ``None`` keeps UUID-derived numbers.
+    used_references: UsedReferences | None = None
 
     def _init_placed_maps(
         self, data: dict[str, Any]
@@ -399,6 +406,7 @@ class SchematicConnectivityAuthoringService:
         project_name: str,
         root_uuid: str,
         power_lib_defs: dict[str, str],
+        allocate_power_reference: Callable[[str], str] | None = None,
     ) -> tuple[str, str, str | None]:
         if self.is_power_net(net):
             if net not in power_lib_defs:
@@ -410,7 +418,11 @@ class SchematicConnectivityAuthoringService:
                 lib_id=f"power:{net}",
                 x=ex,
                 y=ey,
-                reference=power_reference_from_uuid(self.new_uuid()),
+                reference=(
+                    allocate_power_reference(net)
+                    if allocate_power_reference is not None
+                    else power_reference_from_uuid(self.new_uuid())
+                ),
                 value=net,
                 rotation=self.power_symbol_rotation_from_vector(ux, uy),
                 project_name=project_name,
@@ -532,6 +544,7 @@ class SchematicConnectivityAuthoringService:
             project_name=project_name,
             root_uuid=root_uuid,
             power_lib_defs=power_lib_defs,
+            allocate_power_reference=state.allocate_power_reference,
         )
         if block_err is not None:
             results.append(block_err)
@@ -598,7 +611,13 @@ class SchematicConnectivityAuthoringService:
 
         project_name = self.project_name()
         root_uuid = str(data.get("uuid") or self.new_uuid())
-        state = _PinLabelBatch()
+        state = _PinLabelBatch(
+            allocate_power_reference=(
+                PowerReferenceAllocator(self.used_references(target.path, True)).allocate
+                if self.used_references is not None
+                else None
+            )
+        )
         wire_blocks = state.wire_blocks
         terminal_blocks = state.terminal_blocks
         results = state.results
