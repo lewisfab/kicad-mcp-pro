@@ -1328,7 +1328,9 @@ async def test_pcb_set_stackup_persists_file_and_supports_impedance_lookup(
     mock_board,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("kicad_mcp.tools.pcb._board_is_open", lambda: False)
+    # The board is open, so the write needs allow_open_board=True and then
+    # asks KiCad to reload the file exactly once.
+    monkeypatch.setattr("kicad_mcp.tools.pcb._board_is_open", lambda: True)
     server = build_server("pcb")
     await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
 
@@ -1336,6 +1338,7 @@ async def test_pcb_set_stackup_persists_file_and_supports_impedance_lookup(
         server,
         "pcb_set_stackup",
         {
+            "allow_open_board": True,
             "layers": [
                 {
                     "name": "F_Cu",
@@ -1370,7 +1373,7 @@ async def test_pcb_set_stackup_persists_file_and_supports_impedance_lookup(
                     "thickness_mm": 0.035,
                     "material": "Copper",
                 },
-            ]
+            ],
         },
     )
     stackup = await call_tool_text(server, "pcb_get_stackup", {})
