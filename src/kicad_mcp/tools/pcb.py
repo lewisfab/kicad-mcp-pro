@@ -325,7 +325,30 @@ def _board_file_layer_name(layer_name: str) -> str:
     return canonical.replace("_", ".")
 
 
+#: KiCad's stackup type names for the technical (non-copper, non-dielectric) layers.
+_TECHNICAL_STACKUP_TYPES: dict[str, str] = {
+    "F_SilkS": "Top Silk Screen",
+    "F_Mask": "Top Solder Mask",
+    "B_Mask": "Bottom Solder Mask",
+    "B_SilkS": "Bottom Silk Screen",
+}
+#: Layer types that only say "copper" or "dielectric" and so carry no technical meaning.
+_GENERIC_STACKUP_TYPES = frozenset({"signal", "copper", "dielectric"})
+
+
+def _technical_stackup_type(layer_name: str) -> str | None:
+    """Return KiCad's stackup type for a mask or silk layer, or ``None``."""
+    return _TECHNICAL_STACKUP_TYPES.get(layer_name.replace(".", "_"))
+
+
+def _is_dielectric_stackup_layer(layer: StackupLayerSpec) -> bool:
+    return not _is_copper_stackup_layer(layer) and _technical_stackup_type(layer.name) is None
+
+
 def _is_copper_stackup_layer(layer: StackupLayerSpec) -> bool:
+    if _technical_stackup_type(layer.name) is not None:
+        # The model's default material is "Copper"; a mask or silk layer never is.
+        return False
     normalized_name = layer.name.replace(".", "_")
     material = layer.material.casefold()
     return (normalized_name in CANONICAL_LAYER_NAMES and normalized_name.endswith("_Cu")) or (
@@ -400,6 +423,9 @@ def _stackup_layer_type(normalized_name: str, raw_type: object) -> str:
     layer_type = str(raw_type or "")
     if layer_type:
         return layer_type
+    technical = _technical_stackup_type(normalized_name)
+    if technical is not None:
+        return technical
     return "signal" if normalized_name.endswith("_Cu") else "dielectric"
 
 
@@ -539,11 +565,37 @@ def _render_general_block(total_thickness_mm: float) -> str:
     return f"(general\n\t(thickness {total_thickness_mm:.4f})\n)"
 
 
-def _render_stackup_layer_block(layer: StackupLayerSpec, order: int) -> str:
+def _render_technical_stackup_layer_block(
+    layer: StackupLayerSpec, order: int, technical_type: str
+) -> str:
+    """Render a mask or silk layer the way KiCad writes it: name, type, mask data."""
+    layer_type = technical_type if layer.type in _GENERIC_STACKUP_TYPES else layer.type
+    lines = [
+        f'(layer "{_board_file_layer_name(layer.name)}" {order}',
+        f'\t(type "{layer_type}")',
+    ]
+    if layer.name.replace(".", "_").endswith("_Mask"):
+        lines.append(f"\t(thickness {layer.thickness_mm:.4f})")
+        if "material" in layer.model_fields_set:
+            lines.append(f'\t(material "{layer.material}")')
+        if layer.epsilon_r is not None:
+            lines.append(f"\t(epsilon_r {layer.epsilon_r:.4f})")
+        if layer.loss_tangent is not None:
+            lines.append(f"\t(loss_tangent {layer.loss_tangent:.4f})")
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def _render_stackup_layer_block(
+    layer: StackupLayerSpec, order: int, dielectric_index: int | None = None
+) -> str:
+    technical_type = _technical_stackup_type(layer.name)
+    if technical_type is not None:
+        return _render_technical_stackup_layer_block(layer, order, technical_type)
     if _is_copper_stackup_layer(layer):
         header = f'(layer "{_board_file_layer_name(layer.name)}" {order}'
     else:
-        header = f"(layer dielectric {order}"
+        header = f"(layer dielectric {dielectric_index if dielectric_index is not None else order}"
     lines = [
         header,
         f'\t(type "{layer.type}")',
@@ -559,7 +611,12 @@ def _render_stackup_layer_block(layer: StackupLayerSpec, order: int) -> str:
 
 
 def _render_stackup_block(layers: list[StackupLayerSpec]) -> str:
-    blocks = [_render_stackup_layer_block(layer, order) for order, layer in enumerate(layers)]
+    blocks: list[str] = []
+    dielectric_index = 0
+    for order, layer in enumerate(layers):
+        if _is_dielectric_stackup_layer(layer):
+            dielectric_index += 1
+        blocks.append(_render_stackup_layer_block(layer, order, dielectric_index or None))
     rendered_layers = "\n".join(_indent_block(block, 1) for block in blocks)
     return (
         f'(stackup\n{rendered_layers}\n\t(copper_finish "None")\n\t(dielectric_constraints no)\n)'
@@ -602,7 +659,7 @@ def _impedance_context_for_layer(
         (
             specs[index]
             for index in range(target_index - 1, -1, -1)
-            if not _is_copper_stackup_layer(specs[index])
+            if _is_dielectric_stackup_layer(specs[index])
         ),
         None,
     )
@@ -610,7 +667,7 @@ def _impedance_context_for_layer(
         (
             specs[index]
             for index in range(target_index + 1, len(specs))
-            if not _is_copper_stackup_layer(specs[index])
+            if _is_dielectric_stackup_layer(specs[index])
         ),
         None,
     )
